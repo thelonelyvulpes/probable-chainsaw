@@ -7,6 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::task::JoinSet;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -25,7 +26,7 @@ async fn main() -> Result<()> {
             let path_str = args.path.as_str();
             match Path::new(path_str).is_dir() {
                 true => date_time_csv_dir(path_str).await,
-                false => date_time_csv_timestamps(&path_str).await,
+                false => date_time_csv_timestamps(path_str).await,
             }
         }
         _ => Err(anyhow!("undefined TASK")),
@@ -37,21 +38,38 @@ async fn date_time_csv_dir(path_str: &str) -> Result<()> {
         .map(|res| res.map(|e| e.path()))
         .collect::<Result<Vec<_>, Error>>()?;
 
-    for p in entries {
-        if p.is_file()
-            && p.extension()
-                .ok_or(Error::new(ErrorKind::InvalidInput, "not a file"))?
-                .to_str()
-                .ok_or(Error::new(ErrorKind::InvalidInput, "not stringable"))?
-                .eq_ignore_ascii_case("csv")
-        {
-            let p = p.as_os_str().to_str().ok_or(Error::new(
-                ErrorKind::InvalidInput,
-                "can't turn os str to str",
-            ))?;
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-            date_time_csv_timestamps(p).await?;
-        }
+    for p in entries {
+        tasks.spawn(async move {
+            let is_file = p.is_file();
+            if !is_file {
+                return Ok(());
+            }
+            let Some(e) = p.extension() else {
+                return Ok(());
+            };
+            let Some(p_str) = e.to_str() else {
+                return Err(anyhow!("cant string?"));
+            };
+            if !p_str.eq_ignore_ascii_case("csv") {
+                return Ok(());
+            }
+            let Some(file_str) = p.as_os_str().to_str() else {
+                return Err(anyhow!("cant string?"));
+            };
+            date_time_csv_timestamps(file_str).await?;
+            Ok(())
+        });
+    }
+
+    while let Some(join_result) = tasks.join_next().await {
+        let Ok(task_result) = join_result else {
+            return Err(anyhow!(join_result.err().unwrap()));
+        };
+        let Ok(_) = task_result else {
+            return Err(task_result.err().unwrap());
+        };
     }
 
     Ok(())
@@ -60,13 +78,18 @@ async fn date_time_csv_dir(path_str: &str) -> Result<()> {
 async fn date_time_csv_timestamps(path: &str) -> Result<()> {
     let f = File::open(path).await?;
     let mut reader = BufReader::new(f);
-    let f_index = path
-        .rmatch_indices('/')
-        .map(|x| x.0)
-        .next()
-        .ok_or(Error::new(ErrorKind::InvalidInput, "bad path"))?;
+
+    let Some(f_index) = path.rmatch_indices('/').map(|x| x.0).next() else {
+        return Err(anyhow!("failed to split path"));
+    };
     let split = path.split_at(f_index);
-    let out_path = format!("{}/dt-{}", split.0, &split.1[1..]);
+    let out_dir = Path::new(split.0).join("dt");
+    if let Err(error) = fs::create_dir(&out_dir) {
+        if !error.kind().eq(&ErrorKind::AlreadyExists) {
+            return Err(anyhow!("can't create directory"));
+        }
+    }
+    let out_path = format!("{}{}", out_dir.to_str().unwrap(), split.1);
     let out_file = File::create(out_path.as_str()).await?;
     let mut writer = BufWriter::new(out_file);
 
@@ -80,15 +103,11 @@ async fn date_time_csv_timestamps(path: &str) -> Result<()> {
         if len == 0 {
             break;
         }
-        if !buffer.contains(',') {
+        let Some(comma) = buffer.match_indices(',').map(|x| x.0).next() else {
             writer.write_all(buffer.as_bytes()).await?;
+            buffer.clear();
             continue;
-        }
-        let comma = buffer
-            .match_indices(',')
-            .map(|x| x.0)
-            .next()
-            .ok_or(Error::new(ErrorKind::InvalidInput, "missing comma"))?;
+        };
         let split = buffer.split_at(comma);
         let timestamp = i64::from_str(split.0)?;
         if let Some(dt) = NaiveDateTime::from_timestamp_opt(timestamp, 0) {
